@@ -122,6 +122,7 @@ def parse_patch(text: str) -> list[FilePatch]:
                 i += 1
                 hlines: list[str] = []
                 old_ln = old_start
+                in_delete_block = False
                 while i < n:
                     hl = lines[i]
                     if hl.startswith("diff --git ") or HUNK_RE.match(hl):
@@ -131,20 +132,25 @@ def parse_patch(text: str) -> list[FilePatch]:
                     if hl.startswith(" "):
                         hlines.append(hl)
                         old_ln += 1
+                        in_delete_block = False
                     elif hl.startswith("-"):
                         hlines.append(hl)
                         cur.old_changed_lines.add(old_ln)
                         old_ln += 1
+                        in_delete_block = True
                     elif hl.startswith("+"):
                         hlines.append(hl)
-                        if old_ln > 1:
-                            cur.old_insert_anchors.add(old_ln - 1)
-                        cur.old_insert_anchors.add(old_ln)
+                        # Only add insertion anchors for PURE insertions (not '-'/'+' replacements!)
+                        if not in_delete_block:
+                            if old_ln > 1:
+                                cur.old_insert_anchors.add(old_ln - 1)
+                            cur.old_insert_anchors.add(old_ln)
                     elif hl.startswith("\\"):
                         hlines.append(hl)
                     elif hl == "":
                         hlines.append(" ")
                         old_ln += 1
+                        in_delete_block = False
                     else:
                         break
                     i += 1

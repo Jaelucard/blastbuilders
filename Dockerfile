@@ -23,7 +23,7 @@ RUN python -c "import tarfile, urllib.request, io, os; \
     && chmod -R a+rX /app/sqlglot
 
 COPY build_tables_cache.py /app/build_tables_cache.py
-RUN python /app/build_tables_cache.py /app/maps/tables.pkl
+RUN python /app/build_tables_cache.py /app/maps/tables
 
 COPY maps/maps.zlib /app/maps/maps.zlib
 COPY patch_utils.py packer.py impact.py verifier.py selector.py /app/

@@ -152,6 +152,15 @@ class ImpactMaps:
                 u |= m
             self.file_union_cov[rel] = u
 
+        # Precompute exact set of repo files imported by tests/dialects/test_dialect.py & tests/test_optimizer.py
+        self.test_dialect_eager_set: set[str] = set(
+            self.eager_imports.get("tests/dialects/test_dialect.py", ())
+        )
+        self.test_dialect_eager_set.add("tests/dialects/test_dialect.py")
+        self.test_optimizer_eager_set: set[str] = set(
+            self.eager_imports.get("tests/test_optimizer.py", ())
+        )
+        self.test_optimizer_eager_set.add("tests/test_optimizer.py")
         self.all_mask = (1 << len(self.map_test_ids)) - 1
 
     def mask_to_nums(self, mask: int) -> list[int]:
@@ -222,6 +231,25 @@ class CommitAnalysis:
     # If ALL non-inert edits in this commit are pure identity-op swaps (`is`<->`==` / `is not`<->`!=`)
     pure_identity_edits: list[IdentityOpEdit] = field(default_factory=list)
     all_edits_are_identity_op: bool = False
+    # If ALL non-inert edits are confined to specific non-base dialect modules (plus subclasses)
+    only_dialect_stems: set[str] | None = None
+    # True if commit touches any module imported by tests.dialects.test_dialect (BigQuery/Hive/Snowflake/Spark2)
+    touches_test_dialect_deps: bool = False
+    # True if commit touches any module imported by tests.test_optimizer
+    touches_test_optimizer_deps: bool = False
+
+
+TEST_DIALECT_PRELOAD_STEMS = frozenset({
+    "bigquery", "hive", "snowflake", "spark2", "spark", "databricks", "athena", "duckdb",
+})
+
+
+def _dialect_stem_from_path(rel: str) -> str | None:
+    if rel.startswith(("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/", "sqlglot/typing/")):
+        stem = Path(rel).stem
+        if stem not in ("__init__", "dialect", "base"):
+            return stem
+    return None
 
 
 def analyze_commit(commit_id: str, patch_text: str, sqlglot_root: Path, maps: ImpactMaps) -> CommitAnalysis:
@@ -235,6 +263,8 @@ def analyze_commit(commit_id: str, patch_text: str, sqlglot_root: Path, maps: Im
     cand_mask = 0
     all_inert = True
     all_identity = True
+    all_leaf_dialects = True
+    leaf_dialect_stems: set[str] = set()
 
     for fp in fps:
         rel = fp.path
@@ -254,11 +284,12 @@ def analyze_commit(commit_id: str, patch_text: str, sqlglot_root: Path, maps: Im
             analysis.candidate_nums = [t["number"] for t in maps.runtime_tests]
             return analysis
 
-        if fp.is_rename and fp.old_path and fp.new_path and fp.old_path != fp.new_path:
-            analysis.patched_files[fp.old_path] = None
-            analysis.patched_files[fp.new_path] = new_text
-        else:
-            analysis.patched_files[rel] = new_text
+        def _record_patched() -> None:
+            if fp.is_rename and fp.old_path and fp.new_path and fp.old_path != fp.new_path:
+                analysis.patched_files[fp.old_path] = None
+                analysis.patched_files[fp.new_path] = new_text
+            else:
+                analysis.patched_files[rel] = new_text
 
         if rel.endswith(".py"):
             is_test_file = rel.startswith("tests/") and (
@@ -269,6 +300,7 @@ def analyze_commit(commit_id: str, patch_text: str, sqlglot_root: Path, maps: Im
             if pdiff.is_inert:
                 continue
 
+            _record_patched()
             all_inert = False
             analysis.touches_any_py = True
 
@@ -276,6 +308,28 @@ def analyze_commit(commit_id: str, patch_text: str, sqlglot_root: Path, maps: Im
                 analysis.pure_identity_edits.append(pdiff.identity_op_edit)
             else:
                 all_identity = False
+
+            if rel in maps.test_dialect_eager_set:
+                analysis.touches_test_dialect_deps = True
+            if rel in maps.test_optimizer_eager_set:
+                analysis.touches_test_optimizer_deps = True
+            dstem = _dialect_stem_from_path(rel)
+            if dstem is not None:
+                leaf_dialect_stems.add(dstem)
+                # Expand with all subclasses of this dialect/parser/generator
+                for prefix in ("sqlglot.dialects.", "sqlglot.parsers.", "sqlglot.generators."):
+                    m_prefix = prefix + dstem + ":"
+                    for ck, subs in maps.subclass_maps.items():
+                        if ck.startswith(m_prefix):
+                            for sk in subs:
+                                sub_mod = sk.split(":")[0]
+                                sub_stem = sub_mod.split(".")[-1]
+                                if sub_stem not in ("dialect", "base", "__init__"):
+                                    leaf_dialect_stems.add(sub_stem)
+                if dstem in TEST_DIALECT_PRELOAD_STEMS or (leaf_dialect_stems & TEST_DIALECT_PRELOAD_STEMS):
+                    analysis.touches_test_dialect_deps = True
+            else:
+                all_leaf_dialects = False
 
             if rel in maps.core_sqlglot_mods:
                 analysis.needs_clean_sqlglot = True
@@ -299,9 +353,22 @@ def analyze_commit(commit_id: str, patch_text: str, sqlglot_root: Path, maps: Im
                 eager_m = maps.rev_eager_mask.get(rel, 0)
                 lazy_m = maps.lazy_imports.get(rel, 0)
                 file_m = maps.file_reads.get(rel, 0) | maps.file_union_cov.get(rel, 0)
-                for num in maps.mask_to_nums(eager_m):
+                mod_name = maps.rel_to_mod.get(rel, "")
+                # Include EVERY test using any dialect/parser/generator/tokenizer defined in this module
+                # (catches lazy-imported dialects like Dremio/Postgres when syntax error breaks import!)
+                dial_m = maps.dialect_usage.get(mod_name, 0) if mod_name else 0
+                if mod_name:
+                    m_pref = mod_name + ":"
+                    for ck, subs in maps.subclass_maps.items():
+                        if ck.startswith(m_pref):
+                            dial_m |= maps.dialect_usage.get(ck, 0)
+                            for sk in subs:
+                                dial_m |= maps.dialect_usage.get(sk, 0)
+                if is_test_file:
+                    file_m |= maps.file_to_mask.get(rel, 0)
+                for num in maps.mask_to_nums(eager_m | dial_m):
                     analysis.confirmed_fail_nums.add(num)
-                cand_mask |= eager_m | lazy_m | file_m
+                cand_mask |= eager_m | lazy_m | file_m | dial_m
                 analysis.py_class_or_top_files.add(rel)
                 continue
 
@@ -399,13 +466,15 @@ def analyze_commit(commit_id: str, patch_text: str, sqlglot_root: Path, maps: Im
                     hit = maps.sym_ref_mask.get(sym, 0)
                     if rel.startswith("sqlglot/typing/"):
                         d_stem = Path(rel).stem
-                        d_mod = f"sqlglot.dialects.{d_stem}"
-                        hit |= maps.dialect_usage.get(d_mod, 0)
-                        for ck, subs in maps.subclass_maps.items():
-                            if ck.startswith(d_mod + ":"):
-                                for sk in subs:
-                                    hit |= maps.dialect_usage.get(sk, 0)
-                        hit |= maps.file_union_cov.get("sqlglot/optimizer/annotate_types.py", 0)
+                        if d_stem in ("__init__", "dialect"):
+                            hit |= maps.file_union_cov.get("sqlglot/optimizer/annotate_types.py", 0)
+                        else:
+                            d_mod = f"sqlglot.dialects.{d_stem}"
+                            hit = maps.dialect_usage.get(d_mod, 0) | maps.file_reads.get(rel, 0)
+                            for ck, subs in maps.subclass_maps.items():
+                                if ck.startswith(d_mod + ":"):
+                                    for sk in subs:
+                                        hit |= maps.dialect_usage.get(sk, 0)
                     if not hit:
                         hit |= maps.file_union_cov.get(rel, 0) | maps.lazy_imports.get(rel, 0)
                     cand_mask |= hit
@@ -415,16 +484,27 @@ def analyze_commit(commit_id: str, patch_text: str, sqlglot_root: Path, maps: Im
                 if is_test_file:
                     cand_mask |= maps.file_to_mask.get(rel, 0)
                 else:
+                    mod_name = maps.rel_to_mod.get(rel, "")
+                    dial_m = maps.dialect_usage.get(mod_name, 0) if mod_name else 0
+                    if mod_name:
+                        m_pref = mod_name + ":"
+                        for ck, subs in maps.subclass_maps.items():
+                            if ck.startswith(m_pref):
+                                dial_m |= maps.dialect_usage.get(ck, 0)
+                                for sk in subs:
+                                    dial_m |= maps.dialect_usage.get(sk, 0)
                     hit = (
                         maps.file_union_cov.get(rel, 0)
                         | maps.lazy_imports.get(rel, 0)
                         | maps.rev_eager_mask.get(rel, 0)
+                        | dial_m
                     )
                     cand_mask |= hit if hit else maps.all_mask
 
             continue
 
         all_identity = False
+        all_leaf_dialects = False
 
         if rel.startswith("tests/fixtures/"):
             sub_fix = rel[len("tests/fixtures/"):]
@@ -435,6 +515,7 @@ def analyze_commit(commit_id: str, patch_text: str, sqlglot_root: Path, maps: Im
                     inert, ch_idx = diff_sql_fixture_pairs(orig_text, new_text)
                 if inert:
                     continue
+                _record_patched()
                 all_inert = False
                 analysis.fixture_changed_indices[sub_fix] = ch_idx
                 f_mask = maps.file_reads.get(rel, 0)
@@ -461,6 +542,7 @@ def analyze_commit(commit_id: str, patch_text: str, sqlglot_root: Path, maps: Im
                     if opt_tid and opt_tid in maps.id_to_bit:
                         cand_mask |= (1 << maps.id_to_bit[opt_tid])
             else:
+                _record_patched()
                 all_inert = False
                 if "tpc-ds" in rel or "tpc-h" in rel:
                     analysis.touches_executor_or_planner = True
@@ -470,9 +552,11 @@ def analyze_commit(commit_id: str, patch_text: str, sqlglot_root: Path, maps: Im
 
         f_mask = maps.file_reads.get(rel, 0)
         if f_mask:
+            _record_patched()
             all_inert = False
             cand_mask |= f_mask
         elif rel in ("pyproject.toml", "setup.py", "setup.cfg") or rel.startswith("sqlglotc/"):
+            _record_patched()
             all_inert = False
             for tid in (
                 "tests/test_sqlglotc.py::TestBuildExt::test_build_removes_obsolete_extensions",
@@ -492,6 +576,8 @@ def analyze_commit(commit_id: str, patch_text: str, sqlglot_root: Path, maps: Im
         return analysis
 
     analysis.all_edits_are_identity_op = bool(all_identity and analysis.pure_identity_edits)
+    if all_leaf_dialects and leaf_dialect_stems:
+        analysis.only_dialect_stems = leaf_dialect_stems
     nums = maps.mask_to_nums(cand_mask)
     if maps.unmapped_nums:
         nums.extend(maps.unmapped_nums)

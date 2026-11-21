@@ -91,11 +91,15 @@ def main() -> None:
 
     inert_list = []
     tier1_clean = []
-    tier2_warm = []
+    tier2a_dialect_deps = []    # touches BigQuery/Hive/Snowflake/Spark2/DuckDB/test_dialect.py
+    tier2b_opt_deps = []        # touches sqlglot/optimizer/* or tests/test_optimizer.py (inherits test_dialect!)
+    tier2c_warm_all = []        # touches neither test_dialect nor test_optimizer deps (inherits BOTH!)
     tier3_pure_fix = []
     fallback_list = []
 
     needs_heavy_libs = False
+    needs_test_dialect_preload = False
+    needs_test_opt_preload = False
     for a in analyses:
         if a.is_inert or not a.candidate_nums:
             inert_list.append(a)
@@ -104,17 +108,32 @@ def main() -> None:
         elif fix_runner.can_handle(a, maps):
             tier3_pure_fix.append(a)
             needs_heavy_libs = True
+            needs_test_opt_preload = True
         else:
-            if not needs_heavy_libs:
-                for n in a.candidate_nums:
-                    tf = maps.num_to_test[n]["file"]
-                    if tf in ("tests/test_optimizer.py", "tests/test_executor.py"):
-                        needs_heavy_libs = True
-                        break
+            has_dialect_test = False
+            has_opt_test = False
+            for n in a.candidate_nums:
+                tf = maps.num_to_test[n]["file"]
+                if tf in ("tests/test_optimizer.py", "tests/test_executor.py"):
+                    needs_heavy_libs = True
+                if tf == "tests/test_optimizer.py":
+                    has_opt_test = True
+                if tf.startswith("tests/dialects/"):
+                    has_dialect_test = True
             if a.needs_clean_sqlglot:
                 tier1_clean.append(a)
+            elif a.touches_test_dialect_deps:
+                tier2a_dialect_deps.append(a)
+            elif a.touches_test_optimizer_deps:
+                tier2b_opt_deps.append(a)
+                if has_dialect_test:
+                    needs_test_dialect_preload = True
             else:
-                tier2_warm.append(a)
+                tier2c_warm_all.append(a)
+                if has_dialect_test:
+                    needs_test_dialect_preload = True
+                if has_opt_test:
+                    needs_test_opt_preload = True
 
     for a in inert_list:
         _emit_line(a.commit_id, [], valid_nums)
@@ -125,7 +144,7 @@ def main() -> None:
         _emit_line(a.commit_id, workers, valid_nums)
         print(f"[sel] {a.commit_id}: APPLY_FAILED -> {len(a.candidate_nums)} tests ({cost_ms/1000:.3f}s)", file=sys.stderr)
 
-    if needs_heavy_libs and (tier1_clean or tier2_warm or tier3_pure_fix):
+    if needs_heavy_libs and (tier1_clean or tier2a_dialect_deps or tier2b_opt_deps or tier2c_warm_all or tier3_pure_fix):
         import duckdb  # noqa: F401
         import numpy  # noqa: F401
         import pandas  # noqa: F401
@@ -153,13 +172,29 @@ def main() -> None:
         _run_forked(a)
 
     # Warm-import sqlglot ONCE in parent
-    if tier2_warm or tier3_pure_fix:
+    if tier2a_dialect_deps or tier2b_opt_deps or tier2c_warm_all or tier3_pure_fix:
         if str(SQLGLOT_ROOT) not in sys.path:
             sys.path.insert(0, str(SQLGLOT_ROOT))
         import sqlglot  # noqa: F401
 
-        # Tier 2: forked verification with 0ms sqlglot import
-        for a in tier2_warm:
+        # Tier 2a: commits touching BigQuery/Hive/Snowflake/Spark2/DuckDB/test_dialect.py
+        for a in tier2a_dialect_deps:
+            _run_forked(a)
+
+        # Warm-import tests.dialects.test_dialect ONCE before Tier 2b/2c
+        if (tier2b_opt_deps or tier2c_warm_all) and needs_test_dialect_preload:
+            import tests.dialects.test_dialect  # noqa: F401
+
+        # Tier 2b: commits touching optimizer/* or test_optimizer.py (inherits test_dialect!)
+        for a in tier2b_opt_deps:
+            _run_forked(a)
+
+        # Warm-import tests.test_optimizer + DuckDB schema ONCE before Tier 2c & Tier 3!
+        if (tier2c_warm_all or tier3_pure_fix) and needs_test_opt_preload:
+            fix_runner._ensure_ready()
+
+        # Tier 2c: remaining forked commits (zero sqlglot, test_dialect & test_optimizer import overhead!)
+        for a in tier2c_warm_all:
             _run_forked(a)
 
         # Tier 3: zero-fork pure optimizer fixture verification!

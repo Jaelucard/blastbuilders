@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Pre-pickle TPC-H and TPC-DS Table objects during Docker build so runtime
-loads them in ~15ms instead of ~500ms of gzip+CSV+literal_eval parsing."""
+"""Pre-pickle TPC-H and TPC-DS Table objects individually during Docker build so
+runtime loads ONLY the specific tables a query references (~5ms instead of ~200ms)."""
 
 from __future__ import annotations
 
@@ -19,8 +19,9 @@ from sqlglot.executor.table import Table
 from tests.helpers import FIXTURES_DIR, TPCH_SCHEMA, TPCDS_SCHEMA
 
 
-def load_tables(directory: str, schema: dict) -> dict[str, Table]:
-    tables: dict[str, Table] = {}
+def save_tables(directory: str, schema: dict, out_dir: Path) -> int:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    total = 0
     for table, columns in schema.items():
         fn = f"{directory}{table}.csv.gz"
         with gzip.open(fn, "rt", newline="") as f:
@@ -38,18 +39,19 @@ def load_tables(directory: str, schema: dict) -> dict[str, Table]:
                 rows.append(
                     tuple(None if (t is not str and v == "") else t(v) for t, v in zip(ctypes, row))
                 )
-        tables[table] = Table(columns=columns, rows=rows)
-    return tables
+        t_obj = Table(columns=columns, rows=rows)
+        dst = out_dir / f"{table}.pkl"
+        data = pickle.dumps(t_obj, protocol=pickle.HIGHEST_PROTOCOL)
+        dst.write_bytes(data)
+        total += len(data)
+    return total
 
 
 def main() -> None:
-    out_path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("/app/maps/tables.pkl")
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    tpch = load_tables(FIXTURES_DIR + "/optimizer/tpc-h/", TPCH_SCHEMA)
-    tpcds = load_tables(FIXTURES_DIR + "/optimizer/tpc-ds/", TPCDS_SCHEMA)
-    with open(out_path, "wb") as f:
-        pickle.dump({"tpch": tpch, "tpcds": tpcds}, f, protocol=pickle.HIGHEST_PROTOCOL)
-    print(f"[build_tables_cache] wrote {out_path} ({out_path.stat().st_size / 1024:.1f} KB)", file=sys.stderr)
+    out_root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("/app/maps/tables")
+    b1 = save_tables(FIXTURES_DIR + "/optimizer/tpc-h/", TPCH_SCHEMA, out_root / "tpch")
+    b2 = save_tables(FIXTURES_DIR + "/optimizer/tpc-ds/", TPCDS_SCHEMA, out_root / "tpcds")
+    print(f"[build_tables_cache] wrote per-table pickles to {out_root} ({(b1+b2)/1024:.1f} KB)", file=sys.stderr)
 
 
 if __name__ == "__main__":

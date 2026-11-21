@@ -38,7 +38,7 @@ from patch_utils import (
 )
 
 SQLGLOT_ROOT = Path("/app/sqlglot").resolve()
-TABLES_PKL = Path("/app/maps/tables.pkl")
+TABLES_DIR = Path("/app/maps/tables")
 
 BENCHMARK_TESTS_FOR_EQUIV = frozenset({
     "tests/test_executor.py::TestExecutor::test_execute_tpcds",
@@ -133,11 +133,21 @@ def _normalize_table_hash(table) -> bytes:
 
 
 def _rewrite_sys_module_paths(ov_root: Path) -> None:
+    """Point already-imported package __path__, module __file__, and tests.helpers
+    FIXTURES_DIR/FILE_DIR from /app/sqlglot/... to ov_root/... so lazy submodules AND
+    fixture/file reads always see the patched overlay files!"""
     base_str = str(SQLGLOT_ROOT)
     base_pref = base_str + os.sep
     for mod in list(sys.modules.values()):
         if mod is None:
             continue
+        f_attr = getattr(mod, "__file__", None)
+        if isinstance(f_attr, str) and f_attr.startswith(base_pref):
+            rel_f = f_attr[len(base_pref):]
+            try:
+                mod.__file__ = str(ov_root / rel_f)
+            except Exception:
+                pass
         p_attr = getattr(mod, "__path__", None)
         if p_attr is None:
             continue
@@ -159,6 +169,20 @@ def _rewrite_sys_module_paths(ov_root: Path) -> None:
                 new_paths.append(p)
         if changed:
             mod.__path__ = new_paths
+
+    # Critically update cached path constants in tests.helpers & tests.test_executor!
+    th = sys.modules.get("tests.helpers")
+    if th is not None:
+        th.FILE_DIR = str(ov_root / "tests")
+        th.FIXTURES_DIR = str(ov_root / "tests/fixtures")
+    te = sys.modules.get("tests.test_executor")
+    if te is not None:
+        te.FIXTURES_DIR = str(ov_root / "tests/fixtures")
+        te.DIR_TPCH = str(ov_root / "tests/fixtures/optimizer/tpc-h/")
+        te.DIR_TPCDS = str(ov_root / "tests/fixtures/optimizer/tpc-ds/")
+    tjp = sys.modules.get("tests.test_jsonpath")
+    if tjp is not None and hasattr(tjp, "FIXTURES_DIR"):
+        tjp.FIXTURES_DIR = str(ov_root / "tests/fixtures")
 
 
 def _impacted_bits_from_subcov(
@@ -339,7 +363,18 @@ def _estimate_verify_cpu_ms(
         est = max(5, int(dur_ms * (total_est / max(1, total_count)) * 0.8))
         return min(dur_ms, est)
 
-    return max(2, int(dur_ms * 0.75))
+    # Cross-dialect filtered Validator tests are much faster than their full recorded time!
+    if analysis.only_dialect_stems and tf.startswith("tests/dialects/test_") and tf != "tests/dialects/test_dialect.py":
+        tf_stem = Path(tf).stem.removeprefix("test_")
+        if tf_stem not in analysis.only_dialect_stems:
+            return max(4, int(dur_ms * 0.25))
+
+    # Calibrated in-process CPU vs pytest recorded duration (pytest overhead dominates tiny tests!)
+    if dur_ms <= 50:
+        return max(2, int(dur_ms * 0.50))
+    if dur_ms <= 200:
+        return max(25, int(dur_ms * 0.70))
+    return max(140, int(dur_ms * 0.90))
 
 
 def _verify_identity_equivalence_sound(analysis: CommitAnalysis, maps: ImpactMaps) -> bool:
@@ -460,8 +495,14 @@ def _run_child_verification(
             signal.alarm(0)
         except BaseException:
             signal.alarm(0)
-            eager_nums = maps.mask_to_nums(maps.rev_eager_mask.get(rel, 0))
-            confirmed_fail.update(eager_nums)
+            fail_mask = maps.rev_eager_mask.get(rel, 0) | maps.dialect_usage.get(mod_name, 0)
+            m_pref = mod_name + ":"
+            for ck, subs in maps.subclass_maps.items():
+                if ck.startswith(m_pref):
+                    fail_mask |= maps.dialect_usage.get(ck, 0)
+                    for sk in subs:
+                        fail_mask |= maps.dialect_usage.get(sk, 0)
+            confirmed_fail.update(maps.mask_to_nums(fail_mask))
             remaining -= confirmed_fail
 
     # Sound runtime proof for pure identity-op edits (`is`<->`==` / `is not`<->`!=`)
@@ -477,43 +518,97 @@ def _run_child_verification(
     # Shared TPC-DS optimize cache between test_tpcds & test_execute_tpcds: q_idx -> opt_sql_hash
     tpcds_opt_hash_cache: dict[int, str] = {}
     tpcds_all_passed_flag = False
+    tpcds_confirmed_fail = False
+    test_tpcds_num = maps.id_to_num.get("tests/test_optimizer.py::TestOptimizer::test_tpcds")
 
-    def get_preloaded_tables() -> dict:
-        nonlocal preloaded_tables_cache
-        if preloaded_tables_cache is None:
-            if not analysis.touches_executor_or_planner and TABLES_PKL.is_file() and not any(
-                "csv.gz" in r for r in analysis.patched_files
-            ):
-                preloaded_tables_cache = pickle.loads(TABLES_PKL.read_bytes())
-            else:
-                import csv, gzip
-                from sqlglot.executor.table import Table
-                from tests.helpers import FIXTURES_DIR, TPCH_SCHEMA, TPCDS_SCHEMA
+    # Install sound Validator.validate_all cross-dialect filter if only leaf dialects were patched!
+    if analysis.only_dialect_stems and "tests/dialects/test_dialect.py" not in analysis.patched_files:
+        def _norm_d(d) -> str:
+            if not d:
+                return ""
+            s = d.value if hasattr(d, "value") else str(d)
+            return s.split(",")[0].strip().lower()
 
-                def _load(d, schema):
-                    out = {}
-                    for table, columns in schema.items():
-                        fn = f"{d}{table}.csv.gz"
-                        with gzip.open(fn, "rt", newline="") as f:
-                            reader = csv.reader(f, delimiter="|")
-                            next(reader)
-                            rows, ctypes = [], []
-                            for row in reader:
-                                if not ctypes:
-                                    for v in row:
-                                        try:
-                                            ctypes.append(type(ast.literal_eval(v)))
-                                        except (ValueError, SyntaxError):
-                                            ctypes.append(str)
-                                rows.append(tuple(None if (t is not str and v == "") else t(v) for t, v in zip(ctypes, row)))
-                        out[table] = Table(columns=columns, rows=rows)
-                    return out
+        affected_stems = set(analysis.only_dialect_stems)
+        # Dialect aliases used in tests (e.g. "spark" <-> "spark2", "tsql" <-> "mssql", "postgres" <-> "postgresql")
+        if "spark2" in affected_stems or "spark" in affected_stems:
+            affected_stems.update({"spark", "spark2", "databricks"})
+        if "postgres" in affected_stems:
+            affected_stems.update({"postgres", "postgresql"})
+        if "tsql" in affected_stems:
+            affected_stems.update({"tsql", "mssql"})
+        if "presto" in affected_stems:
+            affected_stems.update({"presto", "trino", "athena"})
 
-                preloaded_tables_cache = {
-                    "tpch": _load(FIXTURES_DIR + "/optimizer/tpc-h/", TPCH_SCHEMA),
-                    "tpcds": _load(FIXTURES_DIR + "/optimizer/tpc-ds/", TPCDS_SCHEMA),
-                }
-        return preloaded_tables_cache
+        def _patch_validator_cls(v_cls) -> None:
+            if getattr(v_cls, "_blast_filtered", False):
+                return
+            orig_va = v_cls.validate_all
+            v_cls._orig_validate_all = orig_va
+            v_cls._blast_filter_active = True
+            v_cls._blast_skipped_any = False
+
+            def _filtered_va(self, sql, read=None, write=None, pretty=False, identify=False):
+                if not v_cls._blast_filter_active:
+                    return orig_va(self, sql, read=read, write=write, pretty=pretty, identify=identify)
+                self_d = _norm_d(self.dialect)
+                if self_d in affected_stems:
+                    return orig_va(self, sql, read=read, write=write, pretty=pretty, identify=identify)
+                f_read = {k: v for k, v in (read or {}).items() if _norm_d(k) in affected_stems} if read else None
+                f_write = {k: v for k, v in (write or {}).items() if _norm_d(k) in affected_stems} if write else None
+                if (read and len(f_read or ()) != len(read)) or (write and len(f_write or ()) != len(write)):
+                    v_cls._blast_skipped_any = True
+                if not f_read and not f_write:
+                    return None
+                return orig_va(self, sql, read=f_read, write=f_write, pretty=pretty, identify=identify)
+
+            v_cls.validate_all = _filtered_va
+            v_cls._blast_filtered = True
+
+        if "tests.dialects.test_dialect" in sys.modules:
+            _patch_validator_cls(sys.modules["tests.dialects.test_dialect"].Validator)
+    else:
+        _patch_validator_cls = None
+
+    table_cache: dict[tuple[str, str], object] = {}
+    can_use_pkl_tables = (
+        not analysis.touches_executor_or_planner
+        and TABLES_DIR.is_dir()
+        and not any("csv.gz" in r for r in analysis.patched_files)
+    )
+
+    def get_single_table(which: str, name: str):
+        key = (which, name)
+        if key in table_cache:
+            return table_cache[key]
+        if can_use_pkl_tables:
+            pkl = TABLES_DIR / which / f"{name}.pkl"
+            if pkl.is_file():
+                tbl = pickle.loads(pkl.read_bytes())
+                table_cache[key] = tbl
+                return tbl
+        import csv, gzip
+        from sqlglot.executor.table import Table
+        from tests.helpers import FIXTURES_DIR, TPCH_SCHEMA, TPCDS_SCHEMA
+        schema = TPCH_SCHEMA if which == "tpch" else TPCDS_SCHEMA
+        d = FIXTURES_DIR + ("/optimizer/tpc-h/" if which == "tpch" else "/optimizer/tpc-ds/")
+        fn = f"{d}{name}.csv.gz"
+        columns = schema[name]
+        with gzip.open(fn, "rt", newline="") as f:
+            reader = csv.reader(f, delimiter="|")
+            next(reader)
+            rows, ctypes = [], []
+            for row in reader:
+                if not ctypes:
+                    for v in row:
+                        try:
+                            ctypes.append(type(ast.literal_eval(v)))
+                        except (ValueError, SyntaxError):
+                            ctypes.append(str)
+                rows.append(tuple(None if (t is not str and v == "") else t(v) for t, v in zip(ctypes, row)))
+        tbl = Table(columns=columns, rows=rows)
+        table_cache[key] = tbl
+        return tbl
 
     def get_duckdb_conn(which: str):
         if which not in duckdb_conns:
@@ -539,8 +634,7 @@ def _run_child_verification(
             expr = parse_one(sql)
             expr = pickle.loads(pickle.dumps(expr))
             if args.get("execute"):
-                tbls_all = get_preloaded_tables()["tpch"]
-                tbls = {t.name: tbls_all[t.name] for t in find_tables(expr)}
+                tbls = {t.name: get_single_table("tpch", t.name) for t in find_tables(expr)}
                 res_tbl = execute(expr, schema=TPCH_SCHEMA, tables=tbls)
                 res_tbl = pickle.loads(pickle.dumps(res_tbl))
                 import numpy as np, pandas as pd
@@ -603,6 +697,7 @@ def _run_child_verification(
         return False
 
     def verify_test_execute_tpcds() -> bool:
+        nonlocal tpcds_confirmed_fail
         from sqlglot import parse_one, find_tables, transpile
         from sqlglot.optimizer import optimize
         from sqlglot.executor import execute
@@ -611,8 +706,6 @@ def _run_child_verification(
         fix_touched = "optimizer/tpc-ds/tpc-ds.sql" in analysis.patched_files
         csv_touched = any("tpc-ds" in r and r.endswith(".csv.gz") for r in analysis.patched_files)
 
-        # If test_tpcds ALREADY verified all 99 optimized ASTs match baseline verbatim,
-        # and neither executor/planner nor duckdb nor serde nor CSVs changed -> GUARANTEED PASS!
         if (
             tpcds_all_passed_flag
             and not analysis.touches_executor_or_planner
@@ -652,11 +745,9 @@ def _run_child_verification(
                     dms = maps.tpcds_exec_queries[ei]["dur_ms"] if ei is not None else 200
                     exec_items.append((ei, qi, meta, sql, dms))
 
-        # Sort fastest-first so failures are caught immediately!
         exec_items.sort(key=lambda x: x[4])
 
         for ei, qi, meta, sql, _ in exec_items:
-            # Stage 1 shortcut using shared tpcds_opt_hash_cache!
             if (
                 ei is not None
                 and not analysis.touches_executor_or_planner
@@ -673,6 +764,9 @@ def _run_child_verification(
                     cached_h = _hash_str(opt_expr.sql(pretty=True))
                     tpcds_opt_hash_cache[qi] = cached_h
                 opt_same = (cached_h == qinfo["opt_hash"])
+                if not opt_same:
+                    # Optimized SQL diverged from baseline -> proves test_tpcds ALSO fails (0 extra CPU!)
+                    tpcds_confirmed_fail = True
                 duck_same = True
                 if analysis.touches_duckdb:
                     duck_same = (_hash_str(transpile(sql, write="duckdb")[0]) == qinfo["duckdb_hash"])
@@ -683,8 +777,7 @@ def _run_child_verification(
             if analysis.touches_serde:
                 expr = pickle.loads(pickle.dumps(expr))
 
-            tbls_all = get_preloaded_tables()["tpcds"]
-            tbls = {t.name: tbls_all[t.name] for t in find_tables(expr)}
+            tbls = {t.name: get_single_table("tpcds", t.name) for t in find_tables(expr)}
             res_tbl = execute(expr, schema=TPCDS_SCHEMA, tables=tbls)
             if analysis.touches_serde:
                 res_tbl = pickle.loads(pickle.dumps(res_tbl))
@@ -876,6 +969,8 @@ def _run_child_verification(
                     mod.wait = _fake_wait
                 if hasattr(mod, "as_completed"):
                     mod.as_completed = _fake_as_completed
+                if _patch_validator_cls is not None and "tests.dialects.test_dialect" in sys.modules:
+                    _patch_validator_cls(sys.modules["tests.dialects.test_dialect"].Validator)
                 loaded_modules[mod_name] = mod
                 signal.alarm(0)
             except BaseException as e:
@@ -899,6 +994,10 @@ def _run_child_verification(
                     test_cls.cache = {}
                     test_cls.tpch_tables = {}
                     test_cls.tpcds_tables = {}
+                    setup_classes_done[cls_key] = True
+                elif tf == "tests/test_optimizer.py" and hasattr(test_cls, "conn"):
+                    # Already initialized in parent (Tier 2c preload)! Just bind our FastSyncPool!
+                    test_cls.pool = _BoundPool()
                     setup_classes_done[cls_key] = True
                 else:
                     test_cls.setUpClass()
@@ -951,6 +1050,13 @@ def _run_child_verification(
             import sqlglot
             saved_dialects = dict(sqlglot.Dialect._classes)
 
+        v_cls = sys.modules["tests.dialects.test_dialect"].Validator if (
+            _patch_validator_cls is not None and "tests.dialects.test_dialect" in sys.modules
+        ) else None
+        if v_cls is not None:
+            v_cls._blast_skipped_any = False
+            v_cls._blast_filter_active = True
+
         failed = False
         try:
             signal.alarm(timeout_s)
@@ -973,6 +1079,25 @@ def _run_child_verification(
                 import sqlglot
                 sqlglot.Dialect._classes.update(saved_dialects)
 
+        # Guard against assertLogs false-failures when _filtered_va skipped calls:
+        # re-run once unfiltered to confirm whether this test truly fails!
+        if failed and v_cls is not None and v_cls._blast_skipped_any:
+            v_cls._blast_filter_active = False
+            failed = False
+            try:
+                signal.alarm(timeout_s)
+                case = test_cls(meth)
+                result = unittest.TestResult()
+                case.run(result)
+                signal.alarm(0)
+                if not result.wasSuccessful():
+                    failed = True
+            except (_FastFail, _TestTimeout, BaseException):
+                signal.alarm(0)
+                failed = True
+            finally:
+                v_cls._blast_filter_active = True
+
         return failed
 
     # -----------------------------------------------------------------------
@@ -986,18 +1111,27 @@ def _run_child_verification(
     tests_gated = 0
     tests_equiv_skipped = 0
 
-    # If pure identity-op equivalence is runtime-proven, run all fast non-benchmark tests FIRST;
-    # if ZERO fast tests fail, benchmark tests are mathematically guaranteed equivalent!
+    # If pure identity-op equivalence is runtime-proven, run up to 15 fastest tiny tests (<= 15ms)
+    # first to guard against any unit test mocking; if all pass, skip heavy/redundant tests!
     deferred_benchmarks: set[int] = set()
     if identity_equiv_proven:
+        tiny_sorted = sorted((n for n in remaining if dur_ms_by_num[n] <= 15), key=lambda n: (dur_ms_by_num[n], n))
+        keep_probe = set(tiny_sorted[:12])
         for n in list(remaining):
-            if maps.num_to_test[n]["id"] in BENCHMARK_TESTS_FOR_EQUIV:
+            if n not in keep_probe:
                 remaining.remove(n)
                 deferred_benchmarks.add(n)
 
     def _run_loop() -> None:
         nonlocal tests_run, tests_passed, tests_failed, tests_slacked, tests_gated
         while remaining:
+            if tpcds_confirmed_fail and test_tpcds_num is not None and test_tpcds_num in remaining:
+                remaining.remove(test_tpcds_num)
+                confirmed_fail.add(test_tpcds_num)
+
+            if not remaining:
+                break
+
             if time.monotonic() > commit_deadline:
                 confirmed_fail.update(remaining)
                 tests_gated += len(remaining)
@@ -1029,23 +1163,35 @@ def _run_child_verification(
             else:
                 best_n = None
                 best_gain = 0
-                for n in sorted(remaining, key=lambda x: (-dur_ms_by_num[x], est_cpu[x], x)):
-                    d_sim = dur_ms_by_num[n]
-                    e_cpu = est_cpu[n]
-                    if e_cpu >= d_sim and d_sim < 1000:
-                        continue
-                    m_sim = optimal_cost_ms(confirmed_fail | {n}, dur_ms_by_num) - cost_F
-                    gain = m_sim - e_cpu
-                    thresh = 0.95 if m_sim >= 1500 else 0.85
-                    if gain > best_gain and e_cpu < m_sim * thresh:
-                        best_gain = gain
-                        best_n = n
-                        if gain >= 1000:
+                # Priority 1: Check if any single test unlocks 100% Shadow-Slack if it fails!
+                # (e.g. test_tpcds right after test_execute_tpcds fails -> saves ALL remaining tests!)
+                rem_cpu_total = sum(est_cpu[x] for x in remaining)
+                for n in sorted(remaining, key=lambda x: (-dur_ms_by_num[x], est_cpu[x], x))[:5]:
+                    if dur_ms_by_num[n] < 1000:
+                        break
+                    if optimal_cost_ms(confirmed_fail | {n}, dur_ms_by_num) == cost_FU:
+                        m_sim = cost_FU - cost_F
+                        if est_cpu[n] < m_sim + (rem_cpu_total - est_cpu[n]) * 0.5:
+                            best_n = n
                             break
 
                 if best_n is None:
-                    rem_cpu_sum = sum(est_cpu[n] for n in remaining)
-                    if (cost_FU - cost_F) > rem_cpu_sum * 1.15 and rem_cpu_sum <= 2000:
+                    for n in sorted(remaining, key=lambda x: (-dur_ms_by_num[x], est_cpu[x], x)):
+                        d_sim = dur_ms_by_num[n]
+                        e_cpu = est_cpu[n]
+                        if e_cpu >= d_sim and d_sim < 1000:
+                            continue
+                        m_sim = optimal_cost_ms(confirmed_fail | {n}, dur_ms_by_num) - cost_F
+                        gain = m_sim - e_cpu
+                        thresh = 0.95 if m_sim >= 1500 else 0.85
+                        if gain > best_gain and e_cpu < m_sim * thresh:
+                            best_gain = gain
+                            best_n = n
+                            if gain >= 1000:
+                                break
+
+                if best_n is None:
+                    if (cost_FU - cost_F) > rem_cpu_total * 1.15 and rem_cpu_total <= 2000:
                         best_n = min(remaining, key=lambda n: (est_cpu[n], -dur_ms_by_num[n], n))
                     else:
                         tests_gated += len(remaining)
@@ -1069,7 +1215,13 @@ def _run_child_verification(
 
             remaining.remove(nxt)
             t_left = max(2, int(commit_deadline - time.monotonic()))
-            t_lim = min(t_left, max(5, min(25, (dur_ms_by_num[nxt] // 1000) * 3 + 5)))
+            d_nxt = dur_ms_by_num[nxt]
+            if d_nxt <= 50:
+                t_lim = min(t_left, 2)
+            elif d_nxt <= 500:
+                t_lim = min(t_left, 3)
+            else:
+                t_lim = min(t_left, max(5, min(20, (d_nxt // 1000) * 3 + 4)))
             failed = run_single_test(nxt, t_lim)
             tests_run += 1
             if failed:
