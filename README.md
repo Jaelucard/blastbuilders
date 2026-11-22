@@ -68,3 +68,12 @@ Push to a public GitHub repository with the `Dockerfile` at its top, then enter 
 - `requirements.lock` is every package in the environment we labeled in, on the image the `Dockerfile` starts from. To run sqlglot's tests the way we did, `pip install -r requirements.lock` and put the sqlglot checkout on `PYTHONPATH`; sqlglot's own `pip install -e .[dev]` picks newer versions.
 - The scorer is linux/amd64. On an Apple Silicon Mac, build and run with `--platform linux/amd64`, as the Makefile does, or your timings and wheels will differ.
 - A change that only adds a comment is not promised to be harmless.
+
+## License & Credits
+
+This project is released under the [MIT License](LICENSE).
+
+Open-source dependencies and resources used:
+- [sqlglot](https://github.com/tobymao/sqlglot) (MIT License, pinned commit `eb11aec4be8cb2122afe713a4816662c3f0fb2fa`)
+- Python packages pinned in [`requirements.lock`](requirements.lock)
+- Builders Buildathon Blast Radius starter kit and scoring harness ([joinbuilders.org](https://www.joinbuilders.org/buildathon))
